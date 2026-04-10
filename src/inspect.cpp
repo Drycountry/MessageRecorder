@@ -8,7 +8,9 @@
 #include <utility>
 #include <vector>
 
-#include "internal/internal.hpp"
+#include "jojo/rec/detail/file_util.hpp"
+#include "jojo/rec/detail/manifest.hpp"
+#include "jojo/rec/detail/segment.hpp"
 
 namespace jojo::rec {
 namespace {

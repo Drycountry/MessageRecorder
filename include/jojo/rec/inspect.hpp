@@ -6,7 +6,8 @@
 #include <string>
 #include <vector>
 
-#include "jojo/rec/types.hpp"
+#include "jojo/rec/inspect_types.hpp"
+#include "jojo/rec/replay_types.hpp"
 
 namespace jojo::rec {
 

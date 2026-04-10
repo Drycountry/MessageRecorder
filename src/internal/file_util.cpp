@@ -5,7 +5,7 @@
 #include <sstream>
 #include <system_error>
 
-#include "internal/internal.hpp"
+#include "jojo/rec/detail/file_util.hpp"
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -99,8 +99,8 @@ bool EnsureDirectory(const std::filesystem::path& path, std::string* error) {
   return true;
 }
 
-/// @brief 以无 BOM 的 UTF-8 文本格式写出整个文件。
-bool WriteTextFileUtf8NoBom(const std::filesystem::path& path, const std::string& text, std::string* error) {
+/// @brief 写文件。
+bool WriteTextFile(const std::filesystem::path& path, const std::string& text, std::string* error) {
   std::ofstream stream(path, std::ios::binary | std::ios::trunc);
   if (!stream.is_open()) {
     SetError("failed to open file for write: " + path.string(), error);
@@ -118,7 +118,7 @@ bool WriteTextFileUtf8NoBom(const std::filesystem::path& path, const std::string
 }
 
 /// @brief 读取整个 UTF-8 文本文件内容。
-bool ReadTextFileUtf8(const std::filesystem::path& path, std::string* text, std::string* error) {
+bool ReadTextFile(const std::filesystem::path& path, std::string* text, std::string* error) {
   std::ifstream stream(path, std::ios::binary);
   if (!stream.is_open()) {
     SetError("failed to open file for read: " + path.string(), error);

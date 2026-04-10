@@ -7,6 +7,44 @@
 
 namespace {
 
+constexpr std::uint32_t kFooterMagic = 0x31544653U;
+constexpr std::size_t kFooterSize = 20;
+
+/// @brief 从小端缓冲区读取 32 位无符号整数。
+std::uint32_t ReadU32Le(const std::vector<std::uint8_t>& bytes, std::size_t offset) {
+  return static_cast<std::uint32_t>(bytes[offset]) | (static_cast<std::uint32_t>(bytes[offset + 1]) << 8U) |
+         (static_cast<std::uint32_t>(bytes[offset + 2]) << 16U) |
+         (static_cast<std::uint32_t>(bytes[offset + 3]) << 24U);
+}
+
+/// @brief 从小端缓冲区读取 64 位无符号整数。
+std::uint64_t ReadU64Le(const std::vector<std::uint8_t>& bytes, std::size_t offset) {
+  std::uint64_t value = 0;
+  for (int index = 0; index < 8; ++index) {
+    value |= static_cast<std::uint64_t>(bytes[offset + index]) << (index * 8);
+  }
+  return value;
+}
+
+/// @brief 读取 segment footer 中记录的索引项数量。
+std::uint64_t LoadSegmentIndexCount(const std::filesystem::path& segment_path) {
+  std::ifstream stream(segment_path, std::ios::binary);
+  test::Require(stream.is_open(), "segment file should be readable");
+
+  stream.seekg(0, std::ios::end);
+  const std::streamoff size = stream.tellg();
+  test::Require(size >= static_cast<std::streamoff>(kFooterSize), "segment should contain a footer");
+  stream.seekg(0, std::ios::beg);
+
+  std::vector<std::uint8_t> bytes(static_cast<std::size_t>(size));
+  stream.read(reinterpret_cast<char*>(bytes.data()), size);
+  test::Require(stream.good() || stream.eof(), "segment bytes should load successfully");
+
+  const std::size_t footer_offset = bytes.size() - kFooterSize;
+  test::RequireEqual(ReadU32Le(bytes, footer_offset), kFooterMagic, "segment footer magic should match");
+  return ReadU64Le(bytes, footer_offset + 12);
+}
+
 /// @brief 构造一条带固定测试元数据的录制消息。
 jojo::rec::RecordedMessage MakeMessage(const std::vector<std::uint8_t>& payload) {
   jojo::rec::RecordedMessage message;
@@ -247,6 +285,84 @@ void TestFsyncIntervalSmoke() {
   std::this_thread::sleep_for(std::chrono::milliseconds(2));
   test::Require(recorder.Flush(&error), error);
   test::Require(recorder.Close(&error), error);
+}
+
+/// @brief 验证稀疏索引优先按单调时间跨度建立锚点。
+void TestSparseIndexTimeIntervalPrimary() {
+  test::TempDir temp_dir;
+  auto config = test::MakeConfig(temp_dir.Path());
+  config.sparse_index_interval_ms = 100;
+  config.sparse_index_max_records = 1000000;
+  config.sparse_index_max_bytes = 32 * 1024 * 1024;
+  std::string error;
+  jojo::rec::Recorder recorder(config, &error);
+  test::Require(recorder.IsOpen(), error);
+
+  const auto payload = test::Bytes("tick");
+  test::Require(recorder.Append(MakeMessage(payload)) == jojo::rec::AppendResult::kOk, "append 1 should succeed");
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  test::Require(recorder.Append(MakeMessage(payload)) == jojo::rec::AppendResult::kOk, "append 2 should succeed");
+  std::this_thread::sleep_for(std::chrono::milliseconds(120));
+  test::Require(recorder.Append(MakeMessage(payload)) == jojo::rec::AppendResult::kOk, "append 3 should succeed");
+  test::Require(recorder.Close(&error), error);
+
+  jojo::rec::RecordingSummary summary;
+  test::Require(jojo::rec::LoadRecordingSummary(recorder.RecordingPath(), &summary, &error), error);
+  test::RequireEqual(static_cast<std::uint64_t>(summary.segments.size()), 1, "test should stay within one segment");
+  test::RequireEqual(LoadSegmentIndexCount(recorder.RecordingPath() / summary.segments[0].file_name), 2,
+                     "time primary condition should produce two sparse index points");
+}
+
+/// @brief 验证在时间条件长期不命中时会按记录数补稀疏索引。
+void TestSparseIndexMaxRecordsFallback() {
+  test::TempDir temp_dir;
+  auto config = test::MakeConfig(temp_dir.Path());
+  config.sparse_index_interval_ms = 60 * 1000;
+  config.sparse_index_max_records = 512;
+  config.sparse_index_max_bytes = 32 * 1024 * 1024;
+  std::string error;
+  jojo::rec::Recorder recorder(config, &error);
+  test::Require(recorder.IsOpen(), error);
+
+  const auto payload = test::Bytes("r");
+  for (std::size_t index = 0; index < 513; ++index) {
+    test::Require(recorder.Append(MakeMessage(payload)) == jojo::rec::AppendResult::kOk,
+                  "record-count fallback append should succeed");
+  }
+  test::Require(recorder.Close(&error), error);
+
+  jojo::rec::RecordingSummary summary;
+  test::Require(jojo::rec::LoadRecordingSummary(recorder.RecordingPath(), &summary, &error), error);
+  test::RequireEqual(static_cast<std::uint64_t>(summary.segments.size()), 1, "test should stay within one segment");
+  test::RequireEqual(LoadSegmentIndexCount(recorder.RecordingPath() / summary.segments[0].file_name), 2,
+                     "record-count fallback should add one extra sparse index point");
+}
+
+/// @brief 验证在时间条件长期不命中时会按字节数补稀疏索引。
+void TestSparseIndexMaxBytesFallback() {
+  test::TempDir temp_dir;
+  auto config = test::MakeConfig(temp_dir.Path());
+  config.queue_capacity_mb = 2;
+  config.segment_max_mb = 8;
+  config.sparse_index_interval_ms = 60 * 1000;
+  config.sparse_index_max_records = 1000000;
+  config.sparse_index_max_bytes = 1024 * 1024;
+  std::string error;
+  jojo::rec::Recorder recorder(config, &error);
+  test::Require(recorder.IsOpen(), error);
+
+  const auto payload = std::vector<std::uint8_t>(400000, 0x5A);
+  for (int index = 0; index < 4; ++index) {
+    test::Require(recorder.Append(MakeMessage(payload)) == jojo::rec::AppendResult::kOk,
+                  "byte-count fallback append should succeed");
+  }
+  test::Require(recorder.Close(&error), error);
+
+  jojo::rec::RecordingSummary summary;
+  test::Require(jojo::rec::LoadRecordingSummary(recorder.RecordingPath(), &summary, &error), error);
+  test::RequireEqual(static_cast<std::uint64_t>(summary.segments.size()), 1, "test should stay within one segment");
+  test::RequireEqual(LoadSegmentIndexCount(recorder.RecordingPath() / summary.segments[0].file_name), 2,
+                     "byte-count fallback should add one extra sparse index point");
 }
 
 /// @brief 收集回放记录序号，并可在指定序号后主动失败的回放目标。
@@ -535,6 +651,9 @@ int RunTests() {
   failures += test::RunTest("close_uses_atomic_directory_rename", TestCloseUsesAtomicDirectoryRename);
   failures += test::RunTest("fsync_every_flush_smoke", TestFsyncEveryFlushSmoke);
   failures += test::RunTest("fsync_interval_smoke", TestFsyncIntervalSmoke);
+  failures += test::RunTest("sparse_index_time_interval_primary", TestSparseIndexTimeIntervalPrimary);
+  failures += test::RunTest("sparse_index_max_records_fallback", TestSparseIndexMaxRecordsFallback);
+  failures += test::RunTest("sparse_index_max_bytes_fallback", TestSparseIndexMaxBytesFallback);
   failures += test::RunTest("replay_segment_checkpoint_seek", TestReplaySegmentCheckpointSeek);
   failures += test::RunTest("replay_seek_and_failure_stop", TestReplaySeekAndFailureStop);
   failures += test::RunTest("replay_seek_during_callback", TestReplaySeekDuringCallback);

@@ -1,28 +1,47 @@
 #include "jojo/rec/replay.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdint>
+#include <deque>
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <utility>
 #include <vector>
 
-#include "internal/internal.hpp"
+#include "jojo/rec/detail/manifest.hpp"
+#include "jojo/rec/detail/segment.hpp"
 
 namespace jojo::rec {
 namespace {
 
 constexpr auto kBusyWaitWindow = std::chrono::microseconds(200);
 constexpr std::size_t kInvalidSegmentListIndex = std::numeric_limits<std::size_t>::max();
+constexpr std::size_t kPrefetchMaxRecords = 64;
+constexpr std::size_t kPrefetchMaxBytes = 1024 * 1024;
+constexpr std::uint32_t kRecordMagic = 0x31524543U;
+constexpr std::uint16_t kRecordHeaderSize = 48;
 
 enum class PrepareEntryStatus {
   kOk,
   kEnd,
   kError,
+};
+
+struct SegmentFilePosition {
+  std::size_t segment_list_index = kInvalidSegmentListIndex;
+  std::uint64_t file_offset = 0;
+};
+
+struct PrefetchedRecord {
+  ReplayMessage message;
+  std::size_t encoded_size_bytes = 0;
 };
 
 /// @brief 在提供错误输出缓冲时写入错误消息。
@@ -105,55 +124,147 @@ bool FindSegmentListIndex(const internal::ManifestData& manifest, const ReplayCu
   return false;
 }
 
-/// @brief 在已加载的 segment 记录数组中找到 lower-bound 位置。
-bool FindRecordIndexInSegment(const std::vector<ReplayMessage>& records, const ReplayCursor& cursor,
-                              std::size_t* record_index) {
+/// @brief 判断一条记录在 lower-bound 意义下是否仍位于目标游标之前。
+bool RecordIsBeforeCursor(const ReplayMessage& record, const ReplayCursor& cursor) {
   switch (cursor.kind) {
-    case ReplayCursorKind::kRecordSequence: {
-      const auto it =
-          std::lower_bound(records.begin(), records.end(), cursor.value,
-                           [](const ReplayMessage& record, std::uint64_t value) { return record.record_seq < value; });
-      if (it == records.end()) {
-        return false;
-      }
-      *record_index = static_cast<std::size_t>(std::distance(records.begin(), it));
-      return true;
-    }
-
-    case ReplayCursorKind::kEventMonoTime: {
-      const auto it = std::lower_bound(
-          records.begin(), records.end(), cursor.value,
-          [](const ReplayMessage& record, std::uint64_t value) { return record.event_mono_ts_us < value; });
-      if (it == records.end()) {
-        return false;
-      }
-      *record_index = static_cast<std::size_t>(std::distance(records.begin(), it));
-      return true;
-    }
-
-    case ReplayCursorKind::kEventUtcTime: {
-      const auto it = std::lower_bound(
-          records.begin(), records.end(), cursor.value,
-          [](const ReplayMessage& record, std::uint64_t value) { return record.event_utc_ts_us < value; });
-      if (it == records.end()) {
-        return false;
-      }
-      *record_index = static_cast<std::size_t>(std::distance(records.begin(), it));
-      return true;
-    }
-
+    case ReplayCursorKind::kRecordSequence:
+      return record.record_seq < cursor.value;
+    case ReplayCursorKind::kEventMonoTime:
+      return record.event_mono_ts_us < cursor.value;
+    case ReplayCursorKind::kEventUtcTime:
+      return record.event_utc_ts_us < cursor.value;
     case ReplayCursorKind::kSegmentCheckpoint:
-      *record_index = 0;
-      return !records.empty();
+      return false;
+  }
+  return false;
+}
+
+/// @brief 判断某个稀疏索引点是否位于目标游标之前。
+bool SegmentIndexEntryIsBeforeCursor(const internal::SegmentIndexEntry& entry, const ReplayCursor& cursor) {
+  switch (cursor.kind) {
+    case ReplayCursorKind::kRecordSequence:
+      return entry.record_seq <= cursor.value;
+    case ReplayCursorKind::kEventMonoTime:
+      return entry.event_mono_ts_us <= cursor.value;
+    case ReplayCursorKind::kEventUtcTime:
+      return entry.event_utc_ts_us <= cursor.value;
+    case ReplayCursorKind::kSegmentCheckpoint:
+      return false;
+  }
+  return false;
+}
+
+/// @brief 从 segment 稀疏索引中选择一个不晚于目标游标的读取锚点。
+std::uint64_t FindAnchorOffset(const internal::SegmentSparseIndexData& sparse_index, const ReplayCursor& cursor) {
+  if (cursor.kind == ReplayCursorKind::kSegmentCheckpoint || sparse_index.entries.empty()) {
+    return 0;
   }
 
-  return false;
+  std::uint64_t anchor_offset = 0;
+  for (const internal::SegmentIndexEntry& entry : sparse_index.entries) {
+    if (!SegmentIndexEntryIsBeforeCursor(entry, cursor)) {
+      break;
+    }
+    anchor_offset = entry.file_offset;
+  }
+  return anchor_offset;
 }
 
 /// @brief 判断录制中是否至少有一个包含记录的 segment。
 bool HasReplayableSegments(const internal::ManifestData& manifest) {
   return std::any_of(manifest.segments.begin(), manifest.segments.end(),
                      [](const SegmentSummary& segment) { return segment.record_count != 0; });
+}
+
+/// @brief 估算一条回放消息在 segment 中占用的总字节数。
+std::size_t MeasureEncodedSize(const ReplayMessage& message) { return kRecordHeaderSize + message.payload.size(); }
+
+/// @brief 从原始字节指针按小端读取 16 位无符号整数。
+std::uint16_t ReadU16(const std::uint8_t* bytes) {
+  return static_cast<std::uint16_t>(bytes[0]) | (static_cast<std::uint16_t>(bytes[1]) << 8U);
+}
+
+/// @brief 从原始字节指针按小端读取 32 位无符号整数。
+std::uint32_t ReadU32(const std::uint8_t* bytes) {
+  std::uint32_t value = 0;
+  for (int index = 0; index < 4; ++index) {
+    value |= static_cast<std::uint32_t>(bytes[index]) << (index * 8);
+  }
+  return value;
+}
+
+/// @brief 从原始字节指针按小端读取 64 位无符号整数。
+std::uint64_t ReadU64(const std::uint8_t* bytes) {
+  std::uint64_t value = 0;
+  for (int index = 0; index < 8; ++index) {
+    value |= static_cast<std::uint64_t>(bytes[index]) << (index * 8);
+  }
+  return value;
+}
+
+/// @brief 从打开的 segment 流中读取固定长度字节。
+bool ReadExact(std::ifstream* stream, std::uint64_t offset, std::uint8_t* destination, std::size_t size) {
+  stream->clear();
+  stream->seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+  if (!stream->good()) {
+    return false;
+  }
+  if (size == 0) {
+    return true;
+  }
+  stream->read(reinterpret_cast<char*>(destination), static_cast<std::streamsize>(size));
+  return stream->good();
+}
+
+/// @brief 只读取 record header，用于 seek 阶段快速判断 lower-bound。
+bool ReadRecordHeaderAtOffset(internal::SegmentReadContext* context, std::uint64_t offset, ReplayMessage* record,
+                              std::uint64_t* next_offset, std::string* error) {
+  if (!context->open) {
+    SetError("segment read context is not open", error);
+    return false;
+  }
+  if (offset >= context->valid_bytes) {
+    SetError("record offset is beyond segment valid bytes: " + context->file_path.string(), error);
+    return false;
+  }
+  if (context->valid_bytes - offset < kRecordHeaderSize) {
+    SetError("truncated record header near byte " + std::to_string(offset) + " in " + context->file_path.string(),
+             error);
+    return false;
+  }
+
+  std::array<std::uint8_t, kRecordHeaderSize> header{};
+  if (!ReadExact(&context->stream, offset, header.data(), header.size())) {
+    SetError("failed to read record header: " + context->file_path.string(), error);
+    return false;
+  }
+  if (ReadU32(header.data()) != kRecordMagic) {
+    SetError("record magic mismatch near byte " + std::to_string(offset) + " in " + context->file_path.string(), error);
+    return false;
+  }
+
+  const std::uint16_t header_size = ReadU16(header.data() + 4);
+  if (header_size != kRecordHeaderSize) {
+    SetError("record header size mismatch near byte " + std::to_string(offset) + " in " + context->file_path.string(),
+             error);
+    return false;
+  }
+
+  const std::uint32_t payload_size = ReadU32(header.data() + 44);
+  const std::uint64_t total_size = static_cast<std::uint64_t>(header_size) + payload_size;
+  if (offset + total_size > context->valid_bytes) {
+    SetError("truncated record body near byte " + std::to_string(offset) + " in " + context->file_path.string(), error);
+    return false;
+  }
+
+  *record = ReplayMessage{};
+  record->record_seq = ReadU64(header.data() + 8);
+  record->event_mono_ts_us = ReadU64(header.data() + 16);
+  record->event_utc_ts_us = ReadU64(header.data() + 24);
+  record->session_id = ReadU64(header.data() + 32);
+  record->message_type = ReadU32(header.data() + 40);
+  *next_offset = offset + total_size;
+  return true;
 }
 
 }  // namespace
@@ -176,9 +287,12 @@ class ReplaySession final : public IReplaySession {
     }
   }
 
-  /// @brief 在启动前定位到初始游标位置。
+  /// @brief 在启动前读取稀疏索引并定位到初始游标位置。
   bool Initialize(const ReplayCursor& initial_cursor, std::string* error) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (!LoadSparseIndexesLocked(error)) {
+      return false;
+    }
     return SeekLocked(initial_cursor, error);
   }
 
@@ -261,50 +375,164 @@ class ReplaySession final : public IReplaySession {
   }
 
  private:
-  /// @brief 丢弃当前已加载的 segment 缓存。
-  void DiscardLoadedSegmentLocked() {
-    std::vector<ReplayMessage>().swap(loaded_segment_records_);
-    loaded_segment_list_index_ = kInvalidSegmentListIndex;
-  }
-
-  /// @brief 加载指定 segment 的完整记录数组并缓存。
-  bool LoadSegmentRecordsLocked(std::size_t segment_list_index, std::string* error) {
-    if (loaded_segment_list_index_ == segment_list_index) {
+  /// @brief 仅在首次初始化时把所有 segment 的稀疏索引加载到内存。
+  bool LoadSparseIndexesLocked(std::string* error) {
+    if (sparse_indexes_loaded_) {
       return true;
     }
 
-    internal::SegmentScanOptions options;
-    options.load_payloads = true;
-    options.max_data_bytes = manifest_.segments[segment_list_index].valid_bytes;
-    internal::SegmentScanResult scan_result;
-    if (!internal::ScanSegment(recording_path_ / manifest_.segments[segment_list_index].file_name, options,
-                               &scan_result, error)) {
-      return false;
+    segment_sparse_indexes_.clear();
+    segment_sparse_indexes_.reserve(manifest_.segments.size());
+    for (const SegmentSummary& segment : manifest_.segments) {
+      internal::SegmentSparseIndexData sparse_index;
+      if (segment.has_footer &&
+          !internal::LoadSegmentSparseIndex(recording_path_ / segment.file_name, &sparse_index, error)) {
+        return false;
+      }
+      segment_sparse_indexes_.push_back(std::move(sparse_index));
     }
-    loaded_segment_records_ = std::move(scan_result.records);
-    loaded_segment_list_index_ = segment_list_index;
+    sparse_indexes_loaded_ = true;
     return true;
   }
 
-  /// @brief 更新当前播放位置并请求重置时间基准。
-  void SetPositionLocked(std::size_t segment_list_index, std::size_t record_index) {
-    current_segment_list_index_ = segment_list_index;
-    current_record_index_ = record_index;
+  /// @brief 返回某个 segment 在回放路径上应该使用的逻辑有效字节数。
+  std::uint64_t SegmentValidBytes(std::size_t segment_list_index) const {
+    if (segment_list_index < segment_sparse_indexes_.size() &&
+        segment_sparse_indexes_[segment_list_index].footer_valid) {
+      return segment_sparse_indexes_[segment_list_index].valid_bytes;
+    }
+    return manifest_.segments[segment_list_index].valid_bytes;
+  }
+
+  /// @brief 返回某个 segment 的绝对路径。
+  std::filesystem::path SegmentPath(std::size_t segment_list_index) const {
+    return recording_path_ / manifest_.segments[segment_list_index].file_name;
+  }
+
+  /// @brief 清空预读窗口并重置累计字节数。
+  void ClearPrefetchLocked() {
+    std::deque<PrefetchedRecord>().swap(prefetch_window_);
+    prefetched_bytes_ = 0;
+    reached_end_ = false;
+  }
+
+  /// @brief 关闭当前复用中的 segment 读流。
+  void ResetReaderLocked() {
+    internal::CloseSegmentReadContext(&stream_reader_);
+    reader_segment_list_index_ = kInvalidSegmentListIndex;
+  }
+
+  /// @brief 使用新的磁盘位置作为后续回放起点。
+  void SetReadPositionLocked(const SegmentFilePosition& position) {
+    ClearPrefetchLocked();
+    ResetReaderLocked();
+    next_read_position_ = position;
     timing_reset_requested_ = true;
     ++cursor_generation_;
   }
 
-  /// @brief 从某个 segment 开始定位到第一个可回放记录。
-  bool SeekToFirstRecordFromSegmentLocked(std::size_t start_segment_list_index, const std::string& eof_message,
-                                          std::string* error) {
-    for (std::size_t index = start_segment_list_index; index < manifest_.segments.size(); ++index) {
-      if (!LoadSegmentRecordsLocked(index, error)) {
+  /// @brief 将读取位置推进到下一个确实还有记录数据的 segment。
+  bool MoveToNextReadablePositionLocked(SegmentFilePosition* position) {
+    while (position->segment_list_index < manifest_.segments.size()) {
+      const std::uint64_t valid_bytes = SegmentValidBytes(position->segment_list_index);
+      if (position->file_offset < valid_bytes) {
+        return true;
+      }
+      if (reader_segment_list_index_ == position->segment_list_index) {
+        ResetReaderLocked();
+      }
+      ++position->segment_list_index;
+      position->file_offset = 0;
+    }
+    return false;
+  }
+
+  /// @brief 确保当前读流已经打开到给定 segment。
+  bool EnsureReaderForPositionLocked(const SegmentFilePosition& position, std::string* error) {
+    const std::uint64_t valid_bytes = SegmentValidBytes(position.segment_list_index);
+    if (reader_segment_list_index_ == position.segment_list_index && stream_reader_.open &&
+        stream_reader_.valid_bytes == valid_bytes) {
+      return true;
+    }
+
+    ResetReaderLocked();
+    if (!internal::OpenSegmentReadContext(SegmentPath(position.segment_list_index), valid_bytes, &stream_reader_,
+                                          error)) {
+      return false;
+    }
+    reader_segment_list_index_ = position.segment_list_index;
+    return true;
+  }
+
+  /// @brief 从当前读位置拉取一条完整消息放入预读窗口。
+  bool PrefetchOneRecordLocked(std::string* error) {
+    if (!MoveToNextReadablePositionLocked(&next_read_position_)) {
+      reached_end_ = true;
+      ResetReaderLocked();
+      return true;
+    }
+    if (!EnsureReaderForPositionLocked(next_read_position_, error)) {
+      return false;
+    }
+
+    ReplayMessage message;
+    std::uint64_t next_offset = 0;
+    if (!internal::ReadRecordAtOffset(&stream_reader_, next_read_position_.file_offset, &message, &next_offset,
+                                      error)) {
+      return false;
+    }
+
+    const std::size_t encoded_size = MeasureEncodedSize(message);
+    prefetched_bytes_ += encoded_size;
+    prefetch_window_.push_back(PrefetchedRecord{std::move(message), encoded_size});
+    next_read_position_.file_offset = next_offset;
+
+    if (!MoveToNextReadablePositionLocked(&next_read_position_)) {
+      reached_end_ = true;
+      ResetReaderLocked();
+    } else if (reader_segment_list_index_ != next_read_position_.segment_list_index) {
+      ResetReaderLocked();
+    }
+    return true;
+  }
+
+  /// @brief 按配置的记录数和字节上限填充一个小型预读窗口。
+  bool FillPrefetchWindowLocked(std::string* error) {
+    while (!reached_end_) {
+      if (!prefetch_window_.empty() &&
+          (prefetch_window_.size() >= kPrefetchMaxRecords || prefetched_bytes_ >= kPrefetchMaxBytes)) {
+        break;
+      }
+      if (!PrefetchOneRecordLocked(error)) {
         return false;
       }
-      if (loaded_segment_records_.empty()) {
+    }
+    return true;
+  }
+
+  /// @brief 从某个 segment 起查找首条可回放记录的磁盘偏移。
+  bool FindFirstRecordPositionFromSegment(std::size_t start_segment_list_index, const std::string& eof_message,
+                                          SegmentFilePosition* position, std::string* error) const {
+    for (std::size_t index = start_segment_list_index; index < manifest_.segments.size(); ++index) {
+      const std::uint64_t valid_bytes = SegmentValidBytes(index);
+      if (valid_bytes == 0) {
         continue;
       }
-      SetPositionLocked(index, 0);
+
+      internal::SegmentReadContext context;
+      if (!internal::OpenSegmentReadContext(SegmentPath(index), valid_bytes, &context, error)) {
+        return false;
+      }
+
+      ReplayMessage header_only;
+      std::uint64_t next_offset = 0;
+      const bool ok = ReadRecordHeaderAtOffset(&context, 0, &header_only, &next_offset, error);
+      internal::CloseSegmentReadContext(&context);
+      if (!ok) {
+        return false;
+      }
+
+      *position = SegmentFilePosition{index, 0};
       return true;
     }
 
@@ -312,22 +540,44 @@ class ReplaySession final : public IReplaySession {
     return false;
   }
 
-  /// @brief 从候选 segment 起查找满足 lower-bound 的第一条记录。
-  bool SeekToLowerBoundLocked(std::size_t start_segment_list_index, const ReplayCursor& cursor,
-                              const std::string& eof_message, std::string* error) {
+  /// @brief 基于 segment 稀疏索引和少量 header 顺扫求出 lower-bound 起点。
+  bool FindLowerBoundPosition(std::size_t start_segment_list_index, const ReplayCursor& cursor,
+                              const std::string& eof_message, SegmentFilePosition* position, std::string* error) const {
     for (std::size_t index = start_segment_list_index; index < manifest_.segments.size(); ++index) {
-      if (!LoadSegmentRecordsLocked(index, error)) {
-        return false;
-      }
-      if (loaded_segment_records_.empty()) {
+      const std::uint64_t valid_bytes = SegmentValidBytes(index);
+      if (valid_bytes == 0) {
         continue;
       }
 
-      std::size_t record_index = 0;
-      if (FindRecordIndexInSegment(loaded_segment_records_, cursor, &record_index)) {
-        SetPositionLocked(index, record_index);
-        return true;
+      std::uint64_t offset = 0;
+      if (index < segment_sparse_indexes_.size()) {
+        offset = FindAnchorOffset(segment_sparse_indexes_[index], cursor);
       }
+      if (offset >= valid_bytes) {
+        offset = 0;
+      }
+
+      internal::SegmentReadContext context;
+      if (!internal::OpenSegmentReadContext(SegmentPath(index), valid_bytes, &context, error)) {
+        return false;
+      }
+
+      while (offset < valid_bytes) {
+        ReplayMessage header_only;
+        std::uint64_t next_offset = 0;
+        if (!ReadRecordHeaderAtOffset(&context, offset, &header_only, &next_offset, error)) {
+          internal::CloseSegmentReadContext(&context);
+          return false;
+        }
+        if (!RecordIsBeforeCursor(header_only, cursor)) {
+          internal::CloseSegmentReadContext(&context);
+          *position = SegmentFilePosition{index, offset};
+          return true;
+        }
+        offset = next_offset;
+      }
+
+      internal::CloseSegmentReadContext(&context);
     }
 
     SetError(eof_message, error);
@@ -341,57 +591,65 @@ class ReplaySession final : public IReplaySession {
       return false;
     }
 
+    SegmentFilePosition position;
     switch (cursor.kind) {
       case ReplayCursorKind::kRecordSequence:
-        return SeekToLowerBoundLocked(segment_list_index, cursor, "record sequence cursor is beyond end of recording",
-                                      error);
+        if (!FindLowerBoundPosition(segment_list_index, cursor, "record sequence cursor is beyond end of recording",
+                                    &position, error)) {
+          return false;
+        }
+        break;
 
       case ReplayCursorKind::kEventMonoTime:
-        return SeekToLowerBoundLocked(segment_list_index, cursor, "monotonic time cursor is beyond end of recording",
-                                      error);
+        if (!FindLowerBoundPosition(segment_list_index, cursor, "monotonic time cursor is beyond end of recording",
+                                    &position, error)) {
+          return false;
+        }
+        break;
 
       case ReplayCursorKind::kEventUtcTime:
-        return SeekToLowerBoundLocked(segment_list_index, cursor, "UTC time cursor is beyond end of recording", error);
+        if (!FindLowerBoundPosition(segment_list_index, cursor, "UTC time cursor is beyond end of recording", &position,
+                                    error)) {
+          return false;
+        }
+        break;
 
       case ReplayCursorKind::kSegmentCheckpoint:
-        return SeekToFirstRecordFromSegmentLocked(segment_list_index, "segment checkpoint is beyond end of recording",
-                                                  error);
+        if (!FindFirstRecordPositionFromSegment(segment_list_index, "segment checkpoint is beyond end of recording",
+                                                &position, error)) {
+          return false;
+        }
+        break;
     }
 
-    SetError("unknown replay cursor kind", error);
-    return false;
+    SetReadPositionLocked(position);
+    return true;
   }
 
-  /// @brief 读取当前位置对应的当前消息，必要时跨 segment 前进。
+  /// @brief 读取当前位置对应的当前消息，必要时再填充预读窗口。
   PrepareEntryStatus PrepareCurrentMessageLocked(ReplayMessage* message, std::uint64_t* generation,
                                                  std::string* error) {
-    for (;;) {
-      if (current_segment_list_index_ >= manifest_.segments.size()) {
-        return PrepareEntryStatus::kEnd;
-      }
-      if (!LoadSegmentRecordsLocked(current_segment_list_index_, error)) {
+    if (prefetch_window_.empty()) {
+      if (!FillPrefetchWindowLocked(error)) {
         return PrepareEntryStatus::kError;
       }
-      if (current_record_index_ < loaded_segment_records_.size()) {
-        *message = loaded_segment_records_[current_record_index_];
-        *generation = cursor_generation_;
-        return PrepareEntryStatus::kOk;
-      }
-
-      ++current_segment_list_index_;
-      current_record_index_ = 0;
-      DiscardLoadedSegmentLocked();
     }
+    if (prefetch_window_.empty()) {
+      return reached_end_ ? PrepareEntryStatus::kEnd : PrepareEntryStatus::kError;
+    }
+
+    *message = prefetch_window_.front().message;
+    *generation = cursor_generation_;
+    return PrepareEntryStatus::kOk;
   }
 
   /// @brief 将当前位置推进到下一条消息。
   void AdvancePositionLocked() {
-    ++current_record_index_;
-    if (current_record_index_ >= loaded_segment_records_.size()) {
-      ++current_segment_list_index_;
-      current_record_index_ = 0;
-      DiscardLoadedSegmentLocked();
+    if (prefetch_window_.empty()) {
+      return;
     }
+    prefetched_bytes_ -= prefetch_window_.front().encoded_size_bytes;
+    prefetch_window_.pop_front();
   }
 
   /// @brief 按当前速度等待两条消息之间应有的回放延迟。
@@ -449,7 +707,7 @@ class ReplaySession final : public IReplaySession {
     std::optional<std::uint64_t> previous_event_mono_ts_us;
     auto last_dispatch_time = std::chrono::steady_clock::now();
 
-    for (;;) {
+    while (true) {
       ReplayMessage entry;
       std::uint64_t observed_generation = 0;
       std::string load_error;
@@ -470,8 +728,8 @@ class ReplaySession final : public IReplaySession {
           return;
         }
         if (prepare_status == PrepareEntryStatus::kError) {
-          result_.failure = ReplayFailure{std::nullopt, std::nullopt,
-                                          load_error.empty() ? "failed to load replay segment" : load_error};
+          result_.failure =
+              ReplayFailure{std::nullopt, std::nullopt, load_error.empty() ? "failed to load replay data" : load_error};
           finished_ = true;
           return;
         }
@@ -483,7 +741,9 @@ class ReplaySession final : public IReplaySession {
       }
 
       if (previous_event_mono_ts_us.has_value()) {
-        const std::uint64_t delta_us = entry.event_mono_ts_us - *previous_event_mono_ts_us;
+        const std::uint64_t delta_us = entry.event_mono_ts_us >= *previous_event_mono_ts_us
+                                           ? entry.event_mono_ts_us - *previous_event_mono_ts_us
+                                           : 0;
         if (!WaitForPlaybackDelay(delta_us, last_dispatch_time, observed_generation)) {
           continue;
         }
@@ -519,7 +779,7 @@ class ReplaySession final : public IReplaySession {
           finished_ = true;
           return;
         }
-        if (timing_reset_requested_ || cursor_generation_ != observed_generation) {
+        if (paused_ || timing_reset_requested_ || cursor_generation_ != observed_generation) {
           continue;
         }
         AdvancePositionLocked();
@@ -529,10 +789,14 @@ class ReplaySession final : public IReplaySession {
 
   std::filesystem::path recording_path_;
   internal::ManifestData manifest_;
-  std::size_t loaded_segment_list_index_ = kInvalidSegmentListIndex;
-  std::vector<ReplayMessage> loaded_segment_records_;
-  std::size_t current_segment_list_index_ = 0;
-  std::size_t current_record_index_ = 0;
+  std::vector<internal::SegmentSparseIndexData> segment_sparse_indexes_;
+  bool sparse_indexes_loaded_ = false;
+  std::deque<PrefetchedRecord> prefetch_window_;
+  std::size_t prefetched_bytes_ = 0;
+  SegmentFilePosition next_read_position_;
+  internal::SegmentReadContext stream_reader_;
+  std::size_t reader_segment_list_index_ = kInvalidSegmentListIndex;
+  bool reached_end_ = false;
   std::uint64_t cursor_generation_ = 0;
   ReplayOptions options_;
   std::unique_ptr<IReplayTarget> target_;

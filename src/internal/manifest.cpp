@@ -2,7 +2,8 @@
 #include <nlohmann/json.hpp>
 #include <sstream>
 
-#include "internal/internal.hpp"
+#include "jojo/rec/detail/file_util.hpp"
+#include "jojo/rec/detail/manifest.hpp"
 
 namespace jojo::rec::internal {
 namespace {
@@ -284,7 +285,7 @@ bool WriteManifest(const std::filesystem::path& recording_path, const ManifestDa
   const std::filesystem::path temp_path = recording_path / "manifest.json.tmp";
   std::string text = ManifestToJson(manifest).dump(2);
   text.push_back('\n');
-  if (!WriteTextFileUtf8NoBom(temp_path, text, error)) {
+  if (!WriteTextFile(temp_path, text, error)) {
     return false;
   }
 
@@ -295,7 +296,7 @@ bool WriteManifest(const std::filesystem::path& recording_path, const ManifestDa
 /// @brief 从磁盘读取并解析 manifest 文件。
 bool LoadManifest(const std::filesystem::path& recording_path, ManifestData* manifest, std::string* error) {
   std::string text;
-  if (!ReadTextFileUtf8(recording_path / "manifest.json", &text, error)) {
+  if (!ReadTextFile(recording_path / "manifest.json", &text, error)) {
     return false;
   }
 

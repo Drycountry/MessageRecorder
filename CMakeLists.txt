@@ -13,15 +13,27 @@ include(CTest)
 
 add_library(
     message_recorder
+    include/jojo/rec/detail/file_util.hpp
+    include/jojo/rec/detail/manifest.hpp
+    include/jojo/rec/detail/recorder_queue.hpp
+    include/jojo/rec/detail/recorder_storage.hpp
+    include/jojo/rec/detail/recorder_worker.hpp
+    include/jojo/rec/detail/segment.hpp
     include/jojo/rec/inspect.hpp
+    include/jojo/rec/inspect_types.hpp
+    include/jojo/rec/record_types.hpp
     include/jojo/rec/recorder.hpp
     include/jojo/rec/replay.hpp
+    include/jojo/rec/replay_types.hpp
     include/jojo/rec/types.hpp
     src/inspect.cpp
     src/recorder.cpp
     src/replay.cpp
     src/internal/file_util.cpp
     src/internal/manifest.cpp
+    src/internal/recorder_queue.cpp
+    src/internal/recorder_storage.cpp
+    src/internal/recorder_worker.cpp
     src/internal/segment.cpp)
 
 target_include_directories(

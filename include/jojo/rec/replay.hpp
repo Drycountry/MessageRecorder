@@ -5,7 +5,7 @@
 #include <memory>
 #include <string>
 
-#include "jojo/rec/types.hpp"
+#include "jojo/rec/replay_types.hpp"
 
 namespace jojo::rec {
 
