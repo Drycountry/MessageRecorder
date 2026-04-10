@@ -17,34 +17,33 @@ struct BenchmarkOptions {
   std::filesystem::path output_root = "benchmark-output";
   std::uint64_t message_count = 200000;
   std::size_t payload_bytes = 256;
-  std::size_t attributes_bytes = 0;
   std::size_t thread_count = 1;
   std::size_t queue_capacity_mb = 64;
   std::size_t queue_buffer_count = 2;
-  std::size_t segment_max_mb = 64;
+  std::size_t segment_max_mb = 2048;
   bool fail_fast = false;
   bool keep_output = false;
 };
 
+/// @brief 打印基准程序命令行帮助。
 void PrintUsage() {
-  std::cout
-      << "Usage:\n"
-      << "  message_recorder_benchmark [options]\n"
-      << "\n"
-      << "Options:\n"
-      << "  --output-root <path>             Root directory for benchmark recordings\n"
-      << "  --messages <count>               Total messages to append (default: 200000)\n"
-      << "  --payload-bytes <count>          Payload bytes per message (default: 256)\n"
-      << "  --attributes-bytes <count>       Attribute bytes per message (default: 0)\n"
-      << "  --threads <count>                Producer threads (default: 1)\n"
-      << "  --queue-capacity-mb <count>      Per-queue capacity in MB (default: 64)\n"
-      << "  --queue-buffer-count <count>     Internal queue buffer count (default: 2, min: 2)\n"
-      << "  --segment-max-mb <count>         Segment rotation threshold in MB (default: 64)\n"
-      << "  --fail-fast                      Use fail-fast backpressure instead of blocking\n"
-      << "  --keep-output                    Keep the generated recording directory\n"
-      << "  --help                           Show this message\n";
+  std::cout << "Usage:\n"
+            << "  message_recorder_benchmark [options]\n"
+            << "\n"
+            << "Options:\n"
+            << "  --output-root <path>             Root directory for benchmark recordings\n"
+            << "  --messages <count>               Total messages to append (default: 200000)\n"
+            << "  --payload-bytes <count>          Payload bytes per message (default: 256)\n"
+            << "  --threads <count>                Producer threads (default: 1)\n"
+            << "  --queue-capacity-mb <count>      Per-queue capacity in MB (default: 64)\n"
+            << "  --queue-buffer-count <count>     Internal queue buffer count (default: 2, min: 2)\n"
+            << "  --segment-max-mb <count>         Segment rotation threshold in MB (default: 2048)\n"
+            << "  --fail-fast                      Use fail-fast backpressure instead of blocking\n"
+            << "  --keep-output                    Keep the generated recording directory\n"
+            << "  --help                           Show this message\n";
 }
 
+/// @brief 将字符串解析为无符号整数。
 bool ParseUnsigned(const std::string& text, std::uint64_t* value) {
   try {
     *value = std::stoull(text);
@@ -54,6 +53,7 @@ bool ParseUnsigned(const std::string& text, std::uint64_t* value) {
   }
 }
 
+/// @brief 解析基准程序命令行参数。
 bool ParseOptions(int argc, char** argv, BenchmarkOptions* options, std::string* error) {
   for (int index = 1; index < argc; ++index) {
     const std::string arg = argv[index];
@@ -101,17 +101,6 @@ bool ParseOptions(int argc, char** argv, BenchmarkOptions* options, std::string*
         return false;
       }
       options->payload_bytes = static_cast<std::size_t>(value);
-      continue;
-    }
-    if (arg == "--attributes-bytes") {
-      const char* raw = require_value("--attributes-bytes");
-      if (raw == nullptr || !ParseUnsigned(raw, &value)) {
-        if (error != nullptr) {
-          *error = "invalid value for --attributes-bytes";
-        }
-        return false;
-      }
-      options->attributes_bytes = static_cast<std::size_t>(value);
       continue;
     }
     if (arg == "--threads") {
@@ -175,6 +164,7 @@ bool ParseOptions(int argc, char** argv, BenchmarkOptions* options, std::string*
   return true;
 }
 
+/// @brief 统计录制中所有 segment 文件大小之和。
 std::uint64_t SumFileBytes(const jojo::rec::RecordingSummary& summary) {
   std::uint64_t total = 0;
   for (const auto& segment : summary.segments) {
@@ -182,34 +172,23 @@ std::uint64_t SumFileBytes(const jojo::rec::RecordingSummary& summary) {
   }
   return total;
 }
-void PrintResult(const BenchmarkOptions& options,
-                 const jojo::rec::RecordingSummary& summary,
-                 std::uint64_t attempted_messages,
-                 std::uint64_t append_ok,
-                 std::uint64_t append_backpressure,
-                 std::uint64_t append_closed,
-                 std::uint64_t append_internal_error,
-                 double append_seconds,
+/// @brief 输出本次基准运行的统计结果。
+void PrintResult(const BenchmarkOptions& options, const jojo::rec::RecordingSummary& summary,
+                 std::uint64_t attempted_messages, std::uint64_t append_ok, std::uint64_t append_backpressure,
+                 std::uint64_t append_closed, std::uint64_t append_internal_error, double append_seconds,
                  double close_seconds) {
   const double total_seconds = append_seconds + close_seconds;
-  const std::uint64_t logical_bytes =
-      summary.total_payload_bytes + summary.total_attributes_bytes;
+  const std::uint64_t logical_bytes = summary.total_payload_bytes;
   const std::uint64_t disk_bytes = SumFileBytes(summary);
   const std::uint64_t total_queue_capacity_mb =
       static_cast<std::uint64_t>(options.queue_capacity_mb) * options.queue_buffer_count;
   const double append_mps = append_seconds > 0.0 ? append_ok / append_seconds : 0.0;
-  const double end_to_end_mps =
-      total_seconds > 0.0 ? summary.total_records / total_seconds : 0.0;
-  const double logical_mib =
-      total_seconds > 0.0 ? logical_bytes / total_seconds / 1024.0 / 1024.0 : 0.0;
-  const double disk_mib =
-      total_seconds > 0.0 ? disk_bytes / total_seconds / 1024.0 / 1024.0 : 0.0;
-  const double logical_mb =
-      total_seconds > 0.0 ? logical_bytes / total_seconds / 1000.0 / 1000.0 : 0.0;
-  const double disk_mb =
-      total_seconds > 0.0 ? disk_bytes / total_seconds / 1000.0 / 1000.0 : 0.0;
-  const double append_logical_mb =
-      append_seconds > 0.0 ? logical_bytes / append_seconds / 1000.0 / 1000.0 : 0.0;
+  const double end_to_end_mps = total_seconds > 0.0 ? summary.total_records / total_seconds : 0.0;
+  const double logical_mib = total_seconds > 0.0 ? logical_bytes / total_seconds / 1024.0 / 1024.0 : 0.0;
+  const double disk_mib = total_seconds > 0.0 ? disk_bytes / total_seconds / 1024.0 / 1024.0 : 0.0;
+  const double logical_mb = total_seconds > 0.0 ? logical_bytes / total_seconds / 1000.0 / 1000.0 : 0.0;
+  const double disk_mb = total_seconds > 0.0 ? disk_bytes / total_seconds / 1000.0 / 1000.0 : 0.0;
+  const double append_logical_mb = append_seconds > 0.0 ? logical_bytes / append_seconds / 1000.0 / 1000.0 : 0.0;
 
   std::cout << "benchmark.recording_path=" << summary.recording_path.string() << "\n"
             << "benchmark.threads=" << options.thread_count << "\n"
@@ -227,7 +206,6 @@ void PrintResult(const BenchmarkOptions& options,
             << "benchmark.close_seconds=" << close_seconds << "\n"
             << "benchmark.total_seconds=" << total_seconds << "\n"
             << "benchmark.payload_bytes=" << summary.total_payload_bytes << "\n"
-            << "benchmark.attributes_bytes=" << summary.total_attributes_bytes << "\n"
             << "benchmark.logical_bytes=" << logical_bytes << "\n"
             << "benchmark.disk_bytes=" << disk_bytes << "\n"
             << "benchmark.append_messages_per_sec=" << append_mps << "\n"
@@ -241,8 +219,9 @@ void PrintResult(const BenchmarkOptions& options,
             << "benchmark.incomplete=" << (summary.incomplete ? "true" : "false") << "\n";
 }
 
-}  // 匿名命名空间
+}  // namespace
 
+/// @brief 运行录制吞吐和关闭阶段基准测试。
 int main(int argc, char** argv) {
   BenchmarkOptions options;
   std::string error;
@@ -260,8 +239,8 @@ int main(int argc, char** argv) {
   config.queue_capacity_mb = options.queue_capacity_mb;
   config.queue_buffer_count = options.queue_buffer_count;
   config.segment_max_mb = options.segment_max_mb;
-  config.backpressure_policy = options.fail_fast ? jojo::rec::BackpressurePolicy::kFailFast
-                                                 : jojo::rec::BackpressurePolicy::kBlock;
+  config.backpressure_policy =
+      options.fail_fast ? jojo::rec::BackpressurePolicy::kFailFast : jojo::rec::BackpressurePolicy::kBlock;
   config.recording_label = "benchmark";
   config.message_type_names = {{1U, "benchmark"}};
 
@@ -286,10 +265,7 @@ int main(int argc, char** argv) {
   for (std::size_t thread_index = 0; thread_index < options.thread_count; ++thread_index) {
     const std::uint64_t thread_messages = base_count + (thread_index < extra ? 1U : 0U);
     workers.emplace_back([&, thread_index, thread_messages]() {
-      std::vector<std::uint8_t> payload(options.payload_bytes,
-                                        static_cast<std::uint8_t>(0x30 + (thread_index % 64)));
-      std::vector<std::uint8_t> attributes(options.attributes_bytes,
-                                           static_cast<std::uint8_t>(0x80 + (thread_index % 64)));
+      std::vector<std::uint8_t> payload(options.payload_bytes, static_cast<std::uint8_t>(0x30 + (thread_index % 64)));
       ready_threads.fetch_add(1, std::memory_order_release);
       while (!start_flag.load(std::memory_order_acquire)) {
         std::this_thread::yield();
@@ -298,11 +274,7 @@ int main(int argc, char** argv) {
         jojo::rec::RecordedMessage message;
         message.session_id = static_cast<std::uint64_t>(thread_index + 1);
         message.message_type = 1U;
-        message.message_version = 1U;
         message.payload = jojo::rec::ByteView{payload.data(), payload.size()};
-        if (!attributes.empty()) {
-          message.attributes = jojo::rec::ByteView{attributes.data(), attributes.size()};
-        }
 
         const auto result = recorder.Append(message);
         if (result == jojo::rec::AppendResult::kOk) {
@@ -342,10 +314,8 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  const double append_seconds =
-      std::chrono::duration<double>(append_end - append_begin).count();
-  const double close_seconds =
-      std::chrono::duration<double>(close_end - close_begin).count();
+  const double append_seconds = std::chrono::duration<double>(append_end - append_begin).count();
+  const double close_seconds = std::chrono::duration<double>(close_end - close_begin).count();
   PrintResult(options, summary, options.message_count, append_ok.load(), append_backpressure.load(),
               append_closed.load(), append_internal_error.load(), append_seconds, close_seconds);
 
@@ -353,8 +323,8 @@ int main(int argc, char** argv) {
     std::error_code ec;
     std::filesystem::remove_all(summary.recording_path, ec);
     if (ec) {
-      std::cerr << "warning: failed to remove benchmark recording '"
-                << summary.recording_path.string() << "': " << ec.message() << "\n";
+      std::cerr << "warning: failed to remove benchmark recording '" << summary.recording_path.string()
+                << "': " << ec.message() << "\n";
     }
   }
   return 0;

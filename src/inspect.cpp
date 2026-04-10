@@ -13,18 +13,20 @@
 namespace jojo::rec {
 namespace {
 
+/// @brief 判断字符串是否以前缀开头。
 bool StartsWith(const std::string& text, const std::string& prefix) {
   return text.size() >= prefix.size() && text.compare(0, prefix.size(), prefix) == 0;
 }
 
+/// @brief 在提供错误输出缓冲时写入错误消息。
 void SetError(const std::string& message, std::string* error) {
   if (error != nullptr) {
     *error = message;
   }
 }
 
-bool ListSegmentFiles(const std::filesystem::path& recording_path,
-                      std::vector<std::filesystem::path>* files,
+/// @brief 列出录制目录中按名称排序的 segment 文件。
+bool ListSegmentFiles(const std::filesystem::path& recording_path, std::vector<std::filesystem::path>* files,
                       std::string* error) {
   files->clear();
   std::error_code ec;
@@ -45,6 +47,7 @@ bool ListSegmentFiles(const std::filesystem::path& recording_path,
   return true;
 }
 
+/// @brief 按文件名建立 manifest 中 segment 摘要的查找表。
 std::map<std::string, SegmentSummary> MakeManifestSegmentMap(const internal::ManifestData& manifest) {
   std::map<std::string, SegmentSummary> result;
   for (const SegmentSummary& segment : manifest.segments) {
@@ -53,16 +56,13 @@ std::map<std::string, SegmentSummary> MakeManifestSegmentMap(const internal::Man
   return result;
 }
 
-bool RebuildFromDisk(const std::filesystem::path& recording_path,
-                     const internal::ManifestData& base_manifest,
-                     internal::ManifestData* rebuilt_manifest,
-                     std::vector<std::string>* issues,
-                     std::string* error) {
+/// @brief 基于磁盘上的 segment 文件重建 manifest 统计和摘要。
+bool RebuildFromDisk(const std::filesystem::path& recording_path, const internal::ManifestData& base_manifest,
+                     internal::ManifestData* rebuilt_manifest, std::vector<std::string>* issues, std::string* error) {
   *rebuilt_manifest = base_manifest;
   rebuilt_manifest->segments.clear();
   rebuilt_manifest->total_records = 0;
   rebuilt_manifest->total_payload_bytes = 0;
-  rebuilt_manifest->total_attributes_bytes = 0;
   rebuilt_manifest->degraded = base_manifest.degraded;
 
   std::vector<std::filesystem::path> files;
@@ -88,7 +88,6 @@ bool RebuildFromDisk(const std::filesystem::path& recording_path,
     rebuilt_manifest->segments.push_back(summary);
     rebuilt_manifest->total_records += summary.record_count;
     rebuilt_manifest->total_payload_bytes += scan_result.total_payload_bytes;
-    rebuilt_manifest->total_attributes_bytes += scan_result.total_attributes_bytes;
 
     if (!scan_result.issues.empty()) {
       rebuilt_manifest->degraded = true;
@@ -97,9 +96,8 @@ bool RebuildFromDisk(const std::filesystem::path& recording_path,
   }
 
   for (const auto& item : manifest_segments) {
-    const bool still_exists = std::any_of(files.begin(), files.end(), [&](const auto& path) {
-      return path.filename().string() == item.first;
-    });
+    const bool still_exists = std::any_of(files.begin(), files.end(),
+                                          [&](const auto& path) { return path.filename().string() == item.first; });
     if (!still_exists) {
       issues->push_back("manifest references missing segment '" + item.first + "'");
       rebuilt_manifest->degraded = true;
@@ -108,8 +106,8 @@ bool RebuildFromDisk(const std::filesystem::path& recording_path,
   return true;
 }
 
-void CompareManifestToDisk(const internal::ManifestData& manifest,
-                           const internal::ManifestData& rebuilt,
+/// @brief 对比 manifest 声明与磁盘重建结果之间的差异。
+void CompareManifestToDisk(const internal::ManifestData& manifest, const internal::ManifestData& rebuilt,
                            std::vector<std::string>* issues) {
   if (manifest.segments.size() != rebuilt.segments.size()) {
     issues->push_back("manifest segment count differs from on-disk segments");
@@ -133,10 +131,9 @@ void CompareManifestToDisk(const internal::ManifestData& manifest,
   }
 }
 
-bool LoadAllRecords(const std::filesystem::path& recording_path,
-                    const internal::ManifestData& manifest,
-                    std::vector<ReplayMessage>* records,
-                    std::vector<std::uint32_t>* segment_indexes,
+/// @brief 按 manifest 顺序加载所有可回放记录及其 segment 索引。
+bool LoadAllRecords(const std::filesystem::path& recording_path, const internal::ManifestData& manifest,
+                    std::vector<ReplayMessage>* records, std::vector<std::uint32_t>* segment_indexes,
                     std::string* error) {
   records->clear();
   segment_indexes->clear();
@@ -156,11 +153,10 @@ bool LoadAllRecords(const std::filesystem::path& recording_path,
   return true;
 }
 
-}  // 匿名命名空间
+}  // namespace
 
-bool LoadRecordingSummary(const std::filesystem::path& recording_path,
-                          RecordingSummary* summary,
-                          std::string* error) {
+/// @brief 从 manifest 读取录制摘要。
+bool LoadRecordingSummary(const std::filesystem::path& recording_path, RecordingSummary* summary, std::string* error) {
   internal::ManifestData manifest;
   if (!internal::LoadManifest(recording_path, &manifest, error)) {
     return false;
@@ -169,6 +165,7 @@ bool LoadRecordingSummary(const std::filesystem::path& recording_path,
   return true;
 }
 
+/// @brief 校验 manifest 与磁盘 segment 之间是否一致。
 VerifyResult VerifyRecording(const std::filesystem::path& recording_path) {
   VerifyResult result;
   internal::ManifestData manifest;
@@ -191,6 +188,7 @@ VerifyResult VerifyRecording(const std::filesystem::path& recording_path) {
   return result;
 }
 
+/// @brief 用磁盘扫描结果重写 manifest，以修复元数据漂移。
 VerifyResult RepairRecording(const std::filesystem::path& recording_path) {
   VerifyResult result;
   internal::ManifestData manifest;
@@ -211,6 +209,11 @@ VerifyResult RepairRecording(const std::filesystem::path& recording_path) {
     result.issues.push_back(error);
     return result;
   }
+  if (!internal::SyncFile(recording_path / "manifest.json", &error) ||
+      !internal::SyncDirectory(recording_path, &error)) {
+    result.issues.push_back(error);
+    return result;
+  }
 
   result.summary = internal::ToRecordingSummary(recording_path, rebuilt);
   result.degraded = rebuilt.degraded;
@@ -219,11 +222,9 @@ VerifyResult RepairRecording(const std::filesystem::path& recording_path) {
   return result;
 }
 
-bool DumpRecording(const std::filesystem::path& recording_path,
-                   const ReplayCursor& cursor,
-                   std::size_t max_records,
-                   std::vector<DumpEntry>* entries,
-                   std::string* error) {
+/// @brief 从指定游标开始导出紧凑记录头摘要。
+bool DumpRecording(const std::filesystem::path& recording_path, const ReplayCursor& cursor, std::size_t max_records,
+                   std::vector<DumpEntry>* entries, std::string* error) {
   internal::ManifestData manifest;
   if (!internal::LoadManifest(recording_path, &manifest, error)) {
     return false;
@@ -249,8 +250,7 @@ bool DumpRecording(const std::filesystem::path& recording_path,
       ++start_index;
     }
   } else if (cursor.kind == ReplayCursorKind::kSegmentCheckpoint && cursor.segment_index.has_value()) {
-    while (start_index < segment_indexes.size() &&
-           segment_indexes[start_index] < *cursor.segment_index) {
+    while (start_index < segment_indexes.size() && segment_indexes[start_index] < *cursor.segment_index) {
       ++start_index;
     }
   }
@@ -263,16 +263,11 @@ bool DumpRecording(const std::filesystem::path& recording_path,
   const std::size_t end_index = std::min(records.size(), start_index + max_records);
   for (std::size_t index = start_index; index < end_index; ++index) {
     const ReplayMessage& record = records[index];
-    entries->push_back(DumpEntry{record.record_seq,
-                                 record.event_mono_ts_us,
-                                 record.event_utc_ts_us,
-                                 record.session_id,
-                                 record.stream_id,
-                                 record.message_type,                                 record.message_version,
-                                 static_cast<std::uint32_t>(record.payload.size()),
-                                 static_cast<std::uint32_t>(record.attributes.size())});
+    entries->push_back(DumpEntry{record.record_seq, record.event_mono_ts_us, record.event_utc_ts_us,
+                                 record.session_id, record.message_type,
+                                 static_cast<std::uint32_t>(record.payload.size())});
   }
   return true;
 }
 
-}  // jojo::rec 命名空间
+}  // namespace jojo::rec

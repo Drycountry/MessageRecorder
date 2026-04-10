@@ -9,8 +9,7 @@ namespace test {
 
 TempDir::TempDir() {
   const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
-  path_ = std::filesystem::temp_directory_path() /
-          ("message_recorder_tests_" + std::to_string(now));
+  path_ = std::filesystem::temp_directory_path() / ("message_recorder_tests_" + std::to_string(now));
   std::filesystem::create_directories(path_);
 }
 
@@ -19,13 +18,9 @@ TempDir::~TempDir() {
   std::filesystem::remove_all(path_, ec);
 }
 
-const std::filesystem::path& TempDir::Path() const {
-  return path_;
-}
+const std::filesystem::path& TempDir::Path() const { return path_; }
 
-std::vector<std::uint8_t> Bytes(const std::string& text) {
-  return std::vector<std::uint8_t>(text.begin(), text.end());
-}
+std::vector<std::uint8_t> Bytes(const std::string& text) { return std::vector<std::uint8_t>(text.begin(), text.end()); }
 
 jojo::rec::RecorderConfig MakeConfig(const std::filesystem::path& root) {
   jojo::rec::RecorderConfig config;
@@ -45,8 +40,7 @@ void Require(bool condition, const std::string& message) {
 
 void RequireEqual(std::uint64_t lhs, std::uint64_t rhs, const std::string& message) {
   if (lhs != rhs) {
-    throw std::runtime_error(message + ": expected=" + std::to_string(rhs) +
-                             " actual=" + std::to_string(lhs));
+    throw std::runtime_error(message + ": expected=" + std::to_string(rhs) + " actual=" + std::to_string(lhs));
   }
 }
 
@@ -67,4 +61,4 @@ int RunTest(const std::string& name, const std::function<void()>& body) {
   }
 }
 
-}  // test 命名空间
+}  // namespace test

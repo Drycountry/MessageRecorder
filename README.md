@@ -109,7 +109,6 @@ Linux:
 
 - `--messages <count>`：总消息数。
 - `--payload-bytes <count>`：每条消息的 payload 字节数。
-- `--attributes-bytes <count>`：每条消息的 attributes 字节数。
 - `--threads <count>`：并发生产者线程数。
 - `--queue-capacity-mb <count>`：每个内部接收队列的容量，单位为 MB。
 - `--queue-buffer-count <count>`：内部接收队列数量，最小为 `2`。
@@ -257,7 +256,7 @@ int main() {
   config.output_root = "recordings";
   config.queue_capacity_mb = 4;
   config.queue_buffer_count = 2;
-  config.segment_max_mb = 32;
+  config.segment_max_mb = 2048;
   config.backpressure_policy = jojo::rec::BackpressurePolicy::kBlock;
   config.recording_label = "demo";
   config.message_type_names = {{1U, "alpha"}};
@@ -273,7 +272,6 @@ int main() {
   jojo::rec::RecordedMessage message;
   message.session_id = 7;
   message.message_type = 1;
-  message.message_version = 1;
   message.payload = jojo::rec::ByteView{payload.data(), payload.size()};
 
   const auto result = recorder.Append(message);
@@ -299,7 +297,7 @@ int main() {
 
 说明：
 
-- `Append()` 返回前会复制 `payload` 和 `attributes`，所以调用方只需保证原始缓冲区在本次调用结束前有效。
+- `Append()` 返回前会复制 `payload`，所以调用方只需保证原始缓冲区在本次调用结束前有效。
 - `queue_capacity_mb` 表示单个内部队列的容量；瞬时排队内存上限通常约为 `queue_buffer_count x queue_capacity_mb`，再加一条正在写入的消息。
 - `BackpressurePolicy::kBlock` 会在所有内部队列都耗尽时阻塞调用线程。
 - `BackpressurePolicy::kFailFast` 会在所有内部队列都耗尽时直接返回 `AppendResult::kBackpressure`。

@@ -8,6 +8,7 @@
 
 namespace {
 
+/// @brief 打印命令行帮助信息。
 void PrintUsage() {
   std::cout << "Usage:\n"
             << "  message_recorder_cli summary <recording_path>\n"
@@ -16,6 +17,7 @@ void PrintUsage() {
             << "  message_recorder_cli dump <recording_path> [cursor_kind] [value] [max_records]\n";
 }
 
+/// @brief 将 CLI 游标参数解析为回放游标。
 jojo::rec::ReplayCursor ParseCursor(const std::string& kind, const std::string& value) {
   if (kind == "seq") {
     return jojo::rec::ReplayCursor::FromRecordSequence(std::stoull(value));
@@ -29,6 +31,7 @@ jojo::rec::ReplayCursor ParseCursor(const std::string& kind, const std::string& 
   return jojo::rec::ReplayCursor::FromSegmentCheckpoint(static_cast<std::uint32_t>(std::stoul(value)));
 }
 
+/// @brief 以文本形式输出录制摘要。
 void PrintSummary(const jojo::rec::RecordingSummary& summary) {
   std::cout << "path: " << summary.recording_path.string() << "\n"
             << "start_utc: " << summary.start_utc << "\n"
@@ -47,6 +50,7 @@ void PrintSummary(const jojo::rec::RecordingSummary& summary) {
   }
 }
 
+/// @brief 输出校验或修复结果，并返回建议的进程退出码。
 int PrintVerifyResult(const jojo::rec::VerifyResult& result) {
   std::cout << "success: " << (result.success ? "true" : "false") << "\n"
             << "degraded: " << (result.degraded ? "true" : "false") << "\n"
@@ -62,6 +66,7 @@ int PrintVerifyResult(const jojo::rec::VerifyResult& result) {
 
 }  // 匿名命名空间
 
+/// @brief CLI 程序入口，负责分发 summary、verify、repair 和 dump 子命令。
 int main(int argc, char** argv) {
   if (argc < 3) {
     PrintUsage();
@@ -102,8 +107,8 @@ int main(int argc, char** argv) {
                 << " mono_us=" << entry.event_mono_ts_us
                 << " utc_us=" << entry.event_utc_ts_us
                 << " session_id=" << entry.session_id
-                << " type=" << entry.message_type                << " payload_size=" << entry.payload_size
-                << " attributes_size=" << entry.attributes_size << "\n";
+                << " type=" << entry.message_type
+                << " payload_size=" << entry.payload_size << "\n";
     }
     return 0;
   }

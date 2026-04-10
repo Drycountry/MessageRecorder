@@ -1,24 +1,22 @@
-#include "internal/internal.hpp"
-
-#include <nlohmann/json.hpp>
-
 #include <cstdint>
+#include <nlohmann/json.hpp>
 #include <sstream>
+
+#include "internal/internal.hpp"
 
 namespace jojo::rec::internal {
 namespace {
 
 using JsonValue = nlohmann::json;
 
+/// @brief 在 JSON 对象中查找指定键对应的值。
 const JsonValue* FindObjectItem(const JsonValue& object, const std::string& key) {
   const auto it = object.find(key);
   return it == object.end() ? nullptr : &(*it);
 }
 
-bool ReadString(const JsonValue& object,
-                const std::string& key,
-                std::string* value,
-                std::string* error) {
+/// @brief 从 manifest JSON 对象中读取必填字符串字段。
+bool ReadString(const JsonValue& object, const std::string& key, std::string* value, std::string* error) {
   const JsonValue* item = FindObjectItem(object, key);
   if (item == nullptr || !item->is_string()) {
     if (error != nullptr) {
@@ -30,9 +28,8 @@ bool ReadString(const JsonValue& object,
   return true;
 }
 
-bool ReadOptionalString(const JsonValue& object,
-                        const std::string& key,
-                        std::optional<std::string>* value,
+/// @brief 从 manifest JSON 对象中读取可空字符串字段。
+bool ReadOptionalString(const JsonValue& object, const std::string& key, std::optional<std::string>* value,
                         std::string* error) {
   const JsonValue* item = FindObjectItem(object, key);
   if (item == nullptr || item->is_null()) {
@@ -49,10 +46,8 @@ bool ReadOptionalString(const JsonValue& object,
   return true;
 }
 
-bool ReadBool(const JsonValue& object,
-              const std::string& key,
-              bool* value,
-              std::string* error) {
+/// @brief 从 manifest JSON 对象中读取布尔字段。
+bool ReadBool(const JsonValue& object, const std::string& key, bool* value, std::string* error) {
   const JsonValue* item = FindObjectItem(object, key);
   if (item == nullptr || !item->is_boolean()) {
     if (error != nullptr) {
@@ -64,10 +59,8 @@ bool ReadBool(const JsonValue& object,
   return true;
 }
 
-bool ReadNumberValue(const JsonValue& item,
-                     const std::string& field_name,
-                     std::uint64_t* value,
-                     std::string* error) {
+/// @brief 将一个 JSON 数值节点解析为非负的 `std::uint64_t`。
+bool ReadNumberValue(const JsonValue& item, const std::string& field_name, std::uint64_t* value, std::string* error) {
   if (item.is_number_unsigned()) {
     *value = item.get<std::uint64_t>();
     return true;
@@ -89,10 +82,8 @@ bool ReadNumberValue(const JsonValue& item,
   return false;
 }
 
-bool ReadNumber(const JsonValue& object,
-                const std::string& key,
-                std::uint64_t* value,
-                std::string* error) {
+/// @brief 从 manifest JSON 对象中读取必填非负数值字段。
+bool ReadNumber(const JsonValue& object, const std::string& key, std::uint64_t* value, std::string* error) {
   const JsonValue* item = FindObjectItem(object, key);
   if (item == nullptr) {
     if (error != nullptr) {
@@ -103,6 +94,7 @@ bool ReadNumber(const JsonValue& object,
   return ReadNumberValue(*item, key, value, error);
 }
 
+/// @brief 将类型 ID 到名称的映射序列化为 JSON 对象。
 JsonValue SerializeTypeMap(const std::map<std::uint32_t, std::string>& values) {
   JsonValue object = JsonValue::object();
   for (const auto& item : values) {
@@ -111,9 +103,8 @@ JsonValue SerializeTypeMap(const std::map<std::uint32_t, std::string>& values) {
   return object;
 }
 
-bool ParseTypeMap(const JsonValue& value,
-                  std::map<std::uint32_t, std::string>* out,
-                  std::string* error) {
+/// @brief 将 manifest 中的类型字典解析为内部映射。
+bool ParseTypeMap(const JsonValue& value, std::map<std::uint32_t, std::string>* out, std::string* error) {
   if (!value.is_object()) {
     if (error != nullptr) {
       *error = "manifest dictionary must be an object";
@@ -133,13 +124,13 @@ bool ParseTypeMap(const JsonValue& value,
   return true;
 }
 
+/// @brief 将可选数字序列化为数字或 `null`。
 JsonValue SerializeOptionalNumber(const std::optional<std::uint64_t>& value) {
   return value.has_value() ? JsonValue(*value) : JsonValue(nullptr);
 }
 
-bool ParseOptionalNumber(const JsonValue& object,
-                         const std::string& key,
-                         std::optional<std::uint64_t>* value,
+/// @brief 从 manifest JSON 对象中读取可空非负数值字段。
+bool ParseOptionalNumber(const JsonValue& object, const std::string& key, std::optional<std::uint64_t>* value,
                          std::string* error) {
   const JsonValue* item = FindObjectItem(object, key);
   if (item == nullptr || item->is_null()) {
@@ -164,25 +155,23 @@ bool ParseOptionalNumber(const JsonValue& object,
   return true;
 }
 
+/// @brief 将单个 segment 摘要序列化为 manifest JSON 条目。
 JsonValue SerializeSegment(const SegmentSummary& segment) {
   return JsonValue{{"segment_index", segment.segment_index},
                    {"file_name", segment.file_name},
                    {"record_count", segment.record_count},
                    {"first_record_seq", SerializeOptionalNumber(segment.first_record_seq)},
                    {"last_record_seq", SerializeOptionalNumber(segment.last_record_seq)},
-                   {"first_event_mono_ts_us",
-                    SerializeOptionalNumber(segment.first_event_mono_ts_us)},
-                   {"last_event_mono_ts_us",
-                    SerializeOptionalNumber(segment.last_event_mono_ts_us)},
-                   {"first_event_utc_ts_us",
-                    SerializeOptionalNumber(segment.first_event_utc_ts_us)},
-                   {"last_event_utc_ts_us",
-                    SerializeOptionalNumber(segment.last_event_utc_ts_us)},
+                   {"first_event_mono_ts_us", SerializeOptionalNumber(segment.first_event_mono_ts_us)},
+                   {"last_event_mono_ts_us", SerializeOptionalNumber(segment.last_event_mono_ts_us)},
+                   {"first_event_utc_ts_us", SerializeOptionalNumber(segment.first_event_utc_ts_us)},
+                   {"last_event_utc_ts_us", SerializeOptionalNumber(segment.last_event_utc_ts_us)},
                    {"file_size_bytes", segment.file_size_bytes},
                    {"valid_bytes", segment.valid_bytes},
                    {"has_footer", segment.has_footer}};
 }
 
+/// @brief 将一个 manifest segment 条目解析为内部摘要。
 bool ParseSegment(const JsonValue& value, SegmentSummary* segment, std::string* error) {
   if (!value.is_object()) {
     if (error != nullptr) {
@@ -199,14 +188,10 @@ bool ParseSegment(const JsonValue& value, SegmentSummary* segment, std::string* 
       !ReadNumber(value, "record_count", &segment->record_count, error) ||
       !ParseOptionalNumber(value, "first_record_seq", &segment->first_record_seq, error) ||
       !ParseOptionalNumber(value, "last_record_seq", &segment->last_record_seq, error) ||
-      !ParseOptionalNumber(value, "first_event_mono_ts_us", &segment->first_event_mono_ts_us,
-                           error) ||
-      !ParseOptionalNumber(value, "last_event_mono_ts_us", &segment->last_event_mono_ts_us,
-                           error) ||
-      !ParseOptionalNumber(value, "first_event_utc_ts_us", &segment->first_event_utc_ts_us,
-                           error) ||
-      !ParseOptionalNumber(value, "last_event_utc_ts_us", &segment->last_event_utc_ts_us,
-                           error) ||
+      !ParseOptionalNumber(value, "first_event_mono_ts_us", &segment->first_event_mono_ts_us, error) ||
+      !ParseOptionalNumber(value, "last_event_mono_ts_us", &segment->last_event_mono_ts_us, error) ||
+      !ParseOptionalNumber(value, "first_event_utc_ts_us", &segment->first_event_utc_ts_us, error) ||
+      !ParseOptionalNumber(value, "last_event_utc_ts_us", &segment->last_event_utc_ts_us, error) ||
       !ReadNumber(value, "file_size_bytes", &segment->file_size_bytes, error) ||
       !ReadNumber(value, "valid_bytes", &segment->valid_bytes, error) ||
       !ReadBool(value, "has_footer", &segment->has_footer, error)) {
@@ -215,18 +200,17 @@ bool ParseSegment(const JsonValue& value, SegmentSummary* segment, std::string* 
   return true;
 }
 
+/// @brief 将内部 manifest 模型转换为 JSON 树。
 JsonValue ManifestToJson(const ManifestData& manifest) {
   JsonValue root = JsonValue::object();
   root["format_version"] = manifest.format_version;
   root["start_utc"] = manifest.start_utc;
-  root["stop_utc"] = manifest.stop_utc.has_value() ? JsonValue(*manifest.stop_utc)
-                                                     : JsonValue(nullptr);
+  root["stop_utc"] = manifest.stop_utc.has_value() ? JsonValue(*manifest.stop_utc) : JsonValue(nullptr);
   root["incomplete"] = manifest.incomplete;
   root["degraded"] = manifest.degraded;
   root["aborted_entries"] = manifest.aborted_entries;
   root["total_records"] = manifest.total_records;
   root["total_payload_bytes"] = manifest.total_payload_bytes;
-  root["total_attributes_bytes"] = manifest.total_attributes_bytes;
   root["recording_label"] = manifest.recording_label;
   root["message_type_names"] = SerializeTypeMap(manifest.message_type_names);
 
@@ -238,6 +222,7 @@ JsonValue ManifestToJson(const ManifestData& manifest) {
   return root;
 }
 
+/// @brief 将 JSON 根节点解析为内部 manifest 模型。
 bool ManifestFromJson(const JsonValue& root, ManifestData* manifest, std::string* error) {
   if (!root.is_object()) {
     if (error != nullptr) {
@@ -258,7 +243,6 @@ bool ManifestFromJson(const JsonValue& root, ManifestData* manifest, std::string
       !ReadNumber(root, "aborted_entries", &manifest->aborted_entries, error) ||
       !ReadNumber(root, "total_records", &manifest->total_records, error) ||
       !ReadNumber(root, "total_payload_bytes", &manifest->total_payload_bytes, error) ||
-      !ReadNumber(root, "total_attributes_bytes", &manifest->total_attributes_bytes, error) ||
       !ReadString(root, "recording_label", &manifest->recording_label, error)) {
     return false;
   }
@@ -292,11 +276,10 @@ bool ManifestFromJson(const JsonValue& root, ManifestData* manifest, std::string
   return true;
 }
 
-}  // 匿名命名空间
+}  // namespace
 
-bool WriteManifest(const std::filesystem::path& recording_path,
-                   const ManifestData& manifest,
-                   std::string* error) {
+/// @brief 以临时文件替换的方式写出 manifest。
+bool WriteManifest(const std::filesystem::path& recording_path, const ManifestData& manifest, std::string* error) {
   const std::filesystem::path manifest_path = recording_path / "manifest.json";
   const std::filesystem::path temp_path = recording_path / "manifest.json.tmp";
   std::string text = ManifestToJson(manifest).dump(2);
@@ -309,9 +292,8 @@ bool WriteManifest(const std::filesystem::path& recording_path,
   return RenameWithReplace(temp_path, manifest_path, error);
 }
 
-bool LoadManifest(const std::filesystem::path& recording_path,
-                  ManifestData* manifest,
-                  std::string* error) {
+/// @brief 从磁盘读取并解析 manifest 文件。
+bool LoadManifest(const std::filesystem::path& recording_path, ManifestData* manifest, std::string* error) {
   std::string text;
   if (!ReadTextFileUtf8(recording_path / "manifest.json", &text, error)) {
     return false;
@@ -329,8 +311,8 @@ bool LoadManifest(const std::filesystem::path& recording_path,
   return ManifestFromJson(root, manifest, error);
 }
 
-RecordingSummary ToRecordingSummary(const std::filesystem::path& recording_path,
-                                    const ManifestData& manifest) {
+/// @brief 将内部 manifest 转换为公共摘要结构。
+RecordingSummary ToRecordingSummary(const std::filesystem::path& recording_path, const ManifestData& manifest) {
   RecordingSummary summary;
   summary.recording_path = recording_path;
   summary.start_utc = manifest.start_utc;
@@ -340,11 +322,10 @@ RecordingSummary ToRecordingSummary(const std::filesystem::path& recording_path,
   summary.aborted_entries = manifest.aborted_entries;
   summary.total_records = manifest.total_records;
   summary.total_payload_bytes = manifest.total_payload_bytes;
-  summary.total_attributes_bytes = manifest.total_attributes_bytes;
   summary.recording_label = manifest.recording_label;
   summary.message_type_names = manifest.message_type_names;
   summary.segments = manifest.segments;
   return summary;
 }
 
-}  // jojo::rec::internal 命名空间
+}  // namespace jojo::rec::internal
